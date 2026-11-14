@@ -1,0 +1,138 @@
+name: android-lite
+
+on:
+  workflow_dispatch:
+    inputs:
+      api:
+        description: Minimum Android API (29 = Mi Mix 2S profile, 31 = default)
+        type: choice
+        options: ["29", "31"]
+        default: "29"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      API: ${{ inputs.api }}
+      NDK_VERSION: 28.2.13676358
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          lfs: false
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /opt/az \
+            /usr/local/share/chromium /usr/lib/google-cloud-sdk
+          sudo apt-get clean
+          df -h /
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            patchelf meson nasm yasm autoconf automake libtool pkg-config \
+            gcc-14 g++-14 git-lfs unzip zip
+
+      - name: Install Android SDK and NDK
+        run: |
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --sdk_root="$HOME/android-sdk" --licenses >/dev/null || true
+          "$SDKM" --sdk_root="$HOME/android-sdk" \
+            "ndk;$NDK_VERSION" "platform-tools" "build-tools;35.0.1" "platforms;android-35"
+          sudo rm -rf /usr/local/lib/android
+          df -h /
+
+      - name: Host libs (lib/linux_x64) and LFS
+        run: |
+          git -c submodule.lib/linux_x64.update=checkout \
+            submodule update --init --depth 1 lib/linux_x64
+          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+          git lfs install --local
+          GIT_TERMINAL_PROMPT=0 git lfs pull
+          df -h /
+
+      - name: Write CI env
+        run: |
+          cat > "$RUNNER_TEMP/ci_env.sh" <<EOF
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          export ANDROID_HOME="$HOME/android-sdk"
+          export ANDROID_NDK_VERSION="$NDK_VERSION"
+          export BUILD_BASE="$HOME/blender_build"
+          export MIX2S_BUILD_BASE="\$BUILD_BASE"
+          cd "$GITHUB_WORKSPACE"
+          if [ "$API" = 29 ]; then
+            source build_files/android/env_mix2s_android10.sh
+          else
+            source build_files/android/env.sh
+          fi
+          EOF
+          mkdir -p "$HOME/blender_build"
+
+      - name: Restore deps cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/blender_build/lib
+            ~/blender_build/android_deps_build/work/python-host-install
+          key: lite-deps-api${{ inputs.api }}-${{ hashFiles('build_files/android/deps/build.sh', 'build_files/build_environment/cmake/versions.cmake') }}-${{ github.run_id }}
+          restore-keys: |
+            lite-deps-api${{ inputs.api }}-${{ hashFiles('build_files/android/deps/build.sh', 'build_files/build_environment/cmake/versions.cmake') }}-
+
+      - name: Build lite dependencies
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/ci_env.sh"
+          LIBDIR="$BUILD_BASE/lib/android_arm64"
+          DEPS=(
+            zlib zstd deflate imath fmt openexr png pugixml jpeg brotli ktx freetype
+            harfbuzz webp tiff openjpeg expat yamlcpp pystring minizipng opencolorio
+            robinmap openimageio sqlite libffi openssl lzma bzip2 python xml2 eigen
+            sse2neon fribidi abseil vulkan_headers meshoptimizer shaderc
+            certifi pip remote_asset_python_deps
+          )
+          for d in "${DEPS[@]}"; do
+            if [ -n "$(ls -A "$LIBDIR/$d" 2>/dev/null)" ]; then
+              echo "skip $d"
+              continue
+            fi
+            build_files/android/deps/build.sh "$d"
+          done
+
+      - name: Trim deps work dir
+        if: always()
+        run: |
+          source "$RUNNER_TEMP/ci_env.sh" >/dev/null || true
+          W="$BUILD_BASE/android_deps_build"
+          rm -rf "$W/downloads"
+          [ -d "$W/work" ] && find "$W/work" -mindepth 1 -maxdepth 1 \
+            ! -name python-host-install -exec rm -rf {} +
+          df -h /
+
+      - name: Save deps cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/blender_build/lib
+            ~/blender_build/android_deps_build/work/python-host-install
+          key: lite-deps-api${{ inputs.api }}-${{ hashFiles('build_files/android/deps/build.sh', 'build_files/build_environment/cmake/versions.cmake') }}-${{ github.run_id }}
+
+      - name: Build lite APK
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/ci_env.sh"
+          python3 build_files/android/build.py lite --no-archive
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$BUILD_BASE"/android_apk_stage/*.apk "$GITHUB_WORKSPACE/out/"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: blender-lite-api${{ inputs.api }}
+          path: out/*.apk
+          if-no-files-found: error

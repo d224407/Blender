@@ -123,7 +123,8 @@ jobs:
           cd "$SRC"
           git lfs install --local
           git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
-          GIT_TERMINAL_PROMPT=0 git lfs pull
+          git config lfs.concurrenttransfers 3
+          for i in 1 2 3 4 5; do GIT_TERMINAL_PROMPT=0 git lfs pull && break; [ $i -eq 5 ] && exit 1; echo retry $i; sleep $((i*60)); done
           n=$(git lfs ls-files | grep -c ' - ' || true)
           echo "LFS pointer-only files: $n"
           [ "$n" -eq 0 ]

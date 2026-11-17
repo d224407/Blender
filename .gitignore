@@ -14,6 +14,7 @@
 !.clang-tidy
 !.editorconfig
 !.well-known/
+!.github/
 
 # The agent skills are versioned; the local agent settings are not. Three of the
 # skills were already in the repository, added past this rule with `git add -f`,

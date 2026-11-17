@@ -1,0 +1,1 @@
+*.xz -filter -diff -merge -text

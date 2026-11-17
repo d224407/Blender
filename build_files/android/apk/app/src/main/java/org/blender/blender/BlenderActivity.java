@@ -468,11 +468,11 @@ public class BlenderActivity extends NativeActivity {
       }
 
       /* "QTI" is what Qualcomm parts report, and it is not a name anybody recognises. */
-      String vendor = Build.SOC_MANUFACTURER;
+      String vendor = Build.VERSION.SDK_INT >= 31 ? Build.SOC_MANUFACTURER : "";
       if ("QTI".equalsIgnoreCase(vendor)) {
         vendor = "Qualcomm";
       }
-      String soc = joinNonEmpty(vendor, Build.SOC_MODEL);
+      String soc = joinNonEmpty(vendor, Build.VERSION.SDK_INT >= 31 ? Build.SOC_MODEL : "");
       if (!soc.isEmpty()) {
         Os.setenv("BLENDER_ANDROID_SOC", soc, true);
       }

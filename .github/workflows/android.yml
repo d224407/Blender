@@ -256,6 +256,35 @@ jobs:
           gh release upload "$DEPS_TAG" /tmp/pub/* --repo "$GITHUB_REPOSITORY" --clobber
           rm -rf /tmp/pub
 
+      - name: Turnip driver and adrenotools
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/ci_env.sh"
+          LIBDIR="$BUILD_BASE/lib/android_arm64"
+          # Latest Mesa Turnip build for Android (single libvulkan_freedreno.so)
+          if [ ! -f "$LIBDIR/turnip/lib/libvulkan_turnip.so" ]; then
+            mkdir -p "$LIBDIR/turnip/lib" /tmp/tu
+            gh release download --repo nihui/mesa-turnip-android-driver \
+              --pattern 'mesa-turnip-android-*.zip' --dir /tmp/tu
+            unzip -qo /tmp/tu/*.zip -d /tmp/tu/x
+            cp /tmp/tu/x/libvulkan_freedreno.so "$LIBDIR/turnip/lib/libvulkan_turnip.so"
+          fi
+          # libadrenotools: static libs for libblender.so, hooks for the APK
+          if [ ! -f "$LIBDIR/adrenotools/lib/libadrenotools.a" ]; then
+            rm -rf /tmp/adt
+            git clone -q --depth 1 --recursive https://github.com/bylaws/libadrenotools.git /tmp/adt
+            cmake -S /tmp/adt -B /tmp/adt/b -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM="android-$API" -DANDROID_STL=c++_shared
+            cmake --build /tmp/adt/b
+            mkdir -p "$LIBDIR/adrenotools/lib" "$LIBDIR/adrenotools/hooks" "$LIBDIR/adrenotools/include"
+            cp /tmp/adt/b/libadrenotools.a "$LIBDIR/adrenotools/lib/"
+            cp "$(find /tmp/adt/b -name liblinkernsbypass.a | head -1)" "$LIBDIR/adrenotools/lib/"
+            cp /tmp/adt/b/src/hook/*.so "$LIBDIR/adrenotools/hooks/"
+            cp -r /tmp/adt/include/. "$LIBDIR/adrenotools/include/"
+          fi
+          ls -l "$LIBDIR/turnip/lib" "$LIBDIR/adrenotools/lib" "$LIBDIR/adrenotools/hooks"
+
       - name: Restore ccache
         uses: actions/cache/restore@v6
         with:

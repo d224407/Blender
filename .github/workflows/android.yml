@@ -117,6 +117,14 @@ jobs:
           fi
           df -h /
 
+      - name: Restore upstream LFS cache
+        uses: actions/cache/restore@v6
+        with:
+          path: src/.git/lfs/objects
+          key: lfs-${{ env.UPSTREAM_REF }}-${{ github.run_id }}
+          restore-keys: |
+            lfs-${{ env.UPSTREAM_REF }}-
+
       - name: Fetch repo LFS files from upstream
         run: |
           set -euo pipefail
@@ -134,6 +142,12 @@ jobs:
             echo "custom splash.png from release"
           fi
           df -h /
+
+      - name: Save upstream LFS cache
+        uses: actions/cache/save@v6
+        with:
+          path: src/.git/lfs/objects
+          key: lfs-${{ env.UPSTREAM_REF }}-${{ github.run_id }}
 
       - name: Write CI env
         run: |
@@ -318,6 +332,30 @@ jobs:
         with:
           path: ~/.ccache
           key: ccache-api${{ env.API }}-${{ github.run_id }}
+
+      - name: Sign APK with repo key
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ]; then
+            echo "::warning::No signing secrets set; APK keeps its per-run key and cannot update an installed build"
+            exit 0
+          fi
+          source "$RUNNER_TEMP/ci_env.sh"
+          export KEY_PASS="${KEY_PASS:-$KS_PASS}"
+          KS="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$KS_B64" | base64 -d > "$KS"
+          BT="$ANDROID_HOME/build-tools/35.0.1"
+          for apk in "$GITHUB_WORKSPACE"/out/*.apk; do
+            "$BT/apksigner" sign --ks "$KS" --ks-key-alias "${KEY_ALIAS:-blender}" \
+              --ks-pass env:KS_PASS --key-pass env:KEY_PASS "$apk"
+            "$BT/apksigner" verify --print-certs "$apk" | head -3
+          done
+          rm -f "$KS"
 
       - uses: actions/upload-artifact@v7
         with:

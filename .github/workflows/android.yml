@@ -1,0 +1,296 @@
+name: android
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["android/**", ".github/workflows/android.yml"]
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream blender/blender tag or branch the patch is applied to
+        default: v5.3.0
+      min_api:
+        description: Minimum Android API (29 runs on Android 10 and newer)
+        type: choice
+        options: ["29", "30", "31", "33"]
+        default: "29"
+      target_api:
+        description: Target Android API
+        type: choice
+        options: ["29", "30", "31", "33", "34"]
+        default: "29"
+      publish_deps:
+        description: After building deps, upload lib/android_arm64 to a release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      UPSTREAM_REF: ${{ inputs.upstream_ref || 'v5.3.0' }}
+      API: ${{ inputs.min_api || '29' }}
+      TARGET_API: ${{ inputs.target_api || '29' }}
+      NDK_VERSION: 28.2.13676358
+      GH_TOKEN: ${{ github.token }}
+      DEPS_TAG: lib-android-arm64-api${{ inputs.min_api || '29' }}
+      SRC: ${{ github.workspace }}/src
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: android
+          sparse-checkout-cone-mode: true
+          filter: blob:none
+          lfs: false
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /opt/az \
+            /usr/local/share/chromium /usr/lib/google-cloud-sdk
+          sudo apt-get clean
+          df -h /
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            patchelf meson nasm yasm autoconf automake libtool pkg-config \
+            gcc-14 g++-14 git-lfs unzip zip xz-utils patch ccache
+
+      - name: Install Android SDK and NDK
+        run: |
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --sdk_root="$HOME/android-sdk" --licenses >/dev/null || true
+          "$SDKM" --sdk_root="$HOME/android-sdk" \
+            "ndk;$NDK_VERSION" "platform-tools" "build-tools;35.0.1" "platforms;android-35"
+          sudo rm -rf /usr/local/lib/android
+          df -h /
+
+      - name: Clone upstream and apply the Android patch
+        run: |
+          set -euo pipefail
+          GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --branch "$UPSTREAM_REF" \
+            https://github.com/blender/blender.git "$SRC"
+          cd "$SRC"
+          xz -dc "$GITHUB_WORKSPACE/android/port.patch.xz" \
+            | patch -p1 --no-backup-if-mismatch
+          find . -name '*.rej' | head
+          git status --short | wc -l
+          df -h /
+
+      - name: Host libs (lib/linux_x64) from release
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+          mkdir -p lib /tmp/libs
+          gh release download cache --repo "$GITHUB_REPOSITORY" \
+            --pattern 'lib_linux_x64.*' --dir /tmp/libs
+          first=$(ls /tmp/libs/lib_linux_x64.* | head -1)
+          if [ "$(head -c 2 "$first")" = PK ]; then
+            cat /tmp/libs/lib_linux_x64.* > /tmp/lib_x64.zip
+            rm -rf /tmp/libs
+            unzip -q /tmp/lib_x64.zip -d lib
+            rm -f /tmp/lib_x64.zip
+          else
+            cat /tmp/libs/lib_linux_x64.* | tar -xJ -C lib
+            rm -rf /tmp/libs
+          fi
+          [ -d lib/linux_x64 ] || mv lib/lib-linux_x64 lib/linux_x64
+          test -d lib/linux_x64
+          n=$({ find lib/linux_x64 -type f -size -200c \
+            -exec grep -l 'git-lfs.github.com/spec' {} + 2>/dev/null || true; } | wc -l)
+          echo "LFS pointer files in lib/linux_x64: $n"
+          if [ "$n" -gt 0 ]; then
+            echo "::error::lib/linux_x64 has $n LFS pointers, not real binaries."
+            exit 1
+          fi
+          df -h /
+
+      - name: Fetch repo LFS files from upstream
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+          git lfs install --local
+          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+          GIT_TERMINAL_PROMPT=0 git lfs pull
+          n=$(git lfs ls-files | grep -c ' - ' || true)
+          echo "LFS pointer-only files: $n"
+          [ "$n" -eq 0 ]
+          mkdir -p /tmp/sp
+          if gh release download cache --repo "$GITHUB_REPOSITORY" -p splash.png -D /tmp/sp --clobber 2>/dev/null; then
+            cp /tmp/sp/splash.png release/datafiles/splash.png
+            echo "custom splash.png from release"
+          fi
+          df -h /
+
+      - name: Write CI env
+        run: |
+          cat > "$RUNNER_TEMP/ci_env.sh" <<EOF
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          export ANDROID_HOME="$HOME/android-sdk"
+          export ANDROID_SDK_ROOT="$HOME/android-sdk"
+          export ANDROID_NDK_VERSION="$NDK_VERSION"
+          export ANDROID_NDK_ROOT="$HOME/android-sdk/ndk/$NDK_VERSION"
+          export ANDROID_NDK_HOME="\$ANDROID_NDK_ROOT"
+          export ANDROID_NDK="\$ANDROID_NDK_ROOT"
+          export ANDROID_ABI="arm64-v8a"
+          export ANDROID_API="$API"
+          export ANDROID_TARGET_API="$TARGET_API"
+          export BUILD_BASE="$HOME/blender_build"
+          cd "$SRC"
+          source build_files/android/env.sh
+          [ -f "\$ANDROID_TOOLCHAIN_FILE" ] || { echo "NDK toolchain missing: \$ANDROID_TOOLCHAIN_FILE" >&2; return 1; }
+          EOF
+          cd "$SRC"
+          chmod +x build_files/android/*.sh build_files/android/deps/*.sh build_files/android/apk/*.sh 2>/dev/null || true
+          mkdir -p "$HOME/blender_build"
+
+      - name: Prebuilt arm64 deps from release
+        id: prebuilt
+        run: |
+          set -uo pipefail
+          B="$HOME/blender_build"
+          mkdir -p "$B/lib" /tmp/deps
+          if gh release download "$DEPS_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern 'lib_android_arm64.tar.xz*' --dir /tmp/deps; then
+            cat /tmp/deps/lib_android_arm64.tar.xz* | tar -xJ -C "$B/lib"
+            test -d "$B/lib/android_arm64"
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No prebuilt deps release ($DEPS_TAG), building from source"
+            echo "have=false" >> "$GITHUB_OUTPUT"
+          fi
+          rm -rf /tmp/deps
+          df -h /
+
+      - name: Restore deps cache
+        if: steps.prebuilt.outputs.have == 'false'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/blender_build/lib
+            ~/blender_build/android_deps_build/work/python-host-install
+          key: lite-deps-api${{ env.API }}-${{ hashFiles('src/build_files/build_environment/cmake/versions.cmake') }}-${{ github.run_id }}
+          restore-keys: |
+            lite-deps-api${{ env.API }}-${{ hashFiles('src/build_files/build_environment/cmake/versions.cmake') }}-
+
+      - name: Build lite dependencies
+        if: steps.prebuilt.outputs.have == 'false'
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/ci_env.sh"
+          LIBDIR="$BUILD_BASE/lib/android_arm64"
+          DEPS=(
+            zlib zstd deflate imath fmt openexr png pugixml jpeg brotli ktx freetype
+            harfbuzz webp tiff openjpeg expat yamlcpp pystring minizipng opencolorio
+            robinmap openimageio sqlite libffi openssl lzma bzip2 python xml2 eigen
+            sse2neon fribidi abseil vulkan_headers meshoptimizer shaderc
+            certifi pip remote_asset_python_deps
+          )
+          for d in "${DEPS[@]}"; do
+            if [ -n "$(ls -A "$LIBDIR/$d" 2>/dev/null)" ]; then
+              echo "skip $d"
+              continue
+            fi
+            bash build_files/android/deps/build.sh "$d"
+          done
+
+      - name: Repair stale minizip (PPMD symbols)
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/ci_env.sh"
+          LIBDIR="$BUILD_BASE/lib/android_arm64"
+          Z="$LIBDIR/minizipng/lib/libminizip.a"
+          n=0
+          if [ -f "$Z" ]; then
+            n=$("$ANDROID_LLVM_BIN/llvm-nm" "$Z" 2>/dev/null | grep -c 'mz_stream_ppmd' || true)
+          fi
+          echo "ppmd symbols in libminizip.a: $n"
+          if [ "$n" -gt 0 ]; then
+            rm -rf "$LIBDIR/minizipng" "$LIBDIR/opencolorio"
+            bash build_files/android/deps/build.sh minizipng opencolorio
+          fi
+
+      - name: Trim deps work dir
+        if: always() && steps.prebuilt.outputs.have == 'false'
+        run: |
+          source "$RUNNER_TEMP/ci_env.sh" >/dev/null || true
+          W="$BUILD_BASE/android_deps_build"
+          rm -rf "$W/downloads"
+          [ -d "$W/work" ] && find "$W/work" -mindepth 1 -maxdepth 1 \
+            ! -name python-host-install -exec rm -rf {} +
+          df -h /
+
+      - name: Save deps cache
+        if: always() && steps.prebuilt.outputs.have == 'false'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/blender_build/lib
+            ~/blender_build/android_deps_build/work/python-host-install
+          key: lite-deps-api${{ env.API }}-${{ hashFiles('src/build_files/build_environment/cmake/versions.cmake') }}-${{ github.run_id }}
+
+      - name: Publish arm64 deps to release
+        if: success() && steps.prebuilt.outputs.have == 'false' && inputs.publish_deps
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pub
+          tar -C "$HOME/blender_build/lib" -cf - android_arm64 \
+            | xz -T0 -6 | split -b 1900M - /tmp/pub/lib_android_arm64.tar.xz
+          ls -la /tmp/pub
+          gh release view "$DEPS_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$DEPS_TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "$DEPS_TAG" --notes "Prebuilt lib/android_arm64 (lite deps)"
+          gh release upload "$DEPS_TAG" /tmp/pub/* --repo "$GITHUB_REPOSITORY" --clobber
+          rm -rf /tmp/pub
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.ccache
+          key: ccache-api${{ env.API }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-api${{ env.API }}-
+
+      - name: Build lite APK
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          CCACHE_DIR: /home/runner/.ccache
+          CCACHE_MAXSIZE: 2G
+          CCACHE_COMPILERCHECK: content
+          CCACHE_BASEDIR: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/ci_env.sh"
+          ccache -z
+          python3 build_files/android/build.py lite --no-archive
+          ccache -s
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          apk=$(ls -t "$BUILD_BASE"/android_apk_stage*/*.apk | head -1)
+          echo "APK: $apk"
+          cp "$apk" "$GITHUB_WORKSPACE/out/"
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.ccache
+          key: ccache-api${{ env.API }}-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: blender-lite-api${{ env.API }}-target${{ env.TARGET_API }}
+          path: out/*.apk
+          if-no-files-found: error

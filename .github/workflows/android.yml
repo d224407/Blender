@@ -276,7 +276,7 @@ jobs:
           set -euo pipefail
           source "$RUNNER_TEMP/ci_env.sh"
           ccache -z
-          python3 build_files/android/build.py lite --no-archive
+          python3 build_files/android/build.py lite --turnip --no-archive
           ccache -s
           mkdir -p "$GITHUB_WORKSPACE/out"
           apk=$(ls -t "$BUILD_BASE"/android_apk_stage*/*.apk | head -1)
